@@ -23,6 +23,17 @@ typedef struct dir_entry
   struct dir_entry *next;
 } dir_entry;
 
+// added by jashing
+int set_creation_timestamp(const char *path);
+int object_version(const char *path);
+int create_object_bak_version(const char *path, int new_version);
+char *time_stamp();
+int set_annotation_meta(const char *path, const char* name, const char* value);
+int get_annotation_meta(const char *path, const char* name);
+#define MAX_ANN_SIZE 256
+char Annotation[MAX_ANN_SIZE];
+
+
 int object_read_fp(const char *path, FILE *fp);
 int object_write_fp(const char *path, FILE *fp);
 int list_directory(const char *path, dir_entry **);

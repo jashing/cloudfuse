@@ -1,8 +1,33 @@
+"""
+Example of Annotation Indexer & Searcher
+
+Author: jashing
+
+
+Prerequest: 
+* swift's client: so that command "swift" can be invoked by shell 
+
+Usages: 
+* cmd for annotating an object by cloudfuse:
+
+  setfattr -n Annotation -v "hot dog" 1.jpg
+  
+* cmd for reading annotation from an object by cloudfuse:
+  
+  getfattr -n Annotation 1.jpg
+
+
+Note: Please use "Annotation" as Metadata key so that this indexer.py can work.
+
+
+"""
+
 import os
 import sys
 import subprocess
 
-swift_cmd = 'swift -A https://172.16.229.53/auth/v1.0/ -U system:root -K testpass '
+# please modify host info
+swift_cmd = 'swift -A https://127.0.0.1/auth/v1.0/ -U system:root -K testpass '
 
 def main(path):
     # query swift pic container
@@ -38,7 +63,7 @@ def main(path):
     while (True):
         keyword = raw_input("Enter you keywords:")
         if keyword == "quit":
-            print "881"
+            print "bye."
             exit(0)
             
         match_flag = 0

@@ -17,10 +17,23 @@
 #include "cloudfsapi.h"
 #include "config.h"
 
+#include <unistd.h>
+#include <getopt.h>
 
 #define OPTION_SIZE 1024
 
 static int cache_timeout;
+
+static dir_entry *path_info(const char *path);
+static void update_dir_cache(const char *path, off_t size, int isdir);
+
+// added by jashing
+int flush_flag = 0;
+int enable_versioning_flag = 0;
+
+// Note: cmd for mounting swift storage with versioning 
+//
+// # cloudfuse -o username=system:root,api_key=testpass,authurl=https://host/auth/v1.0/,cache_timeout=100,versioning=true  /mnt/swift
 
 typedef struct dir_cache
 {
@@ -37,6 +50,67 @@ typedef struct
   int fd;
   int flags;
 } openfile;
+
+
+// added by jashing
+// given src path, generate dst as .src.timestamp
+// return 1 if success, otherwise 0
+int bak_version(const char *src)
+{
+  static char dst[1024] = {0};
+  debugf("in bak_version, src=%s", src);
+
+  char *timestamp = (char *)malloc(sizeof(char) * 16);
+  time_t ltime;
+  ltime=time(NULL);
+  struct tm *tm;
+  tm=localtime(&ltime);
+
+  sprintf(timestamp,"%04d%02d%02d%02d%02d%02d", tm->tm_year+1900, tm->tm_mon,
+    tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec);
+
+  //debugf("in bak_version, timestamp=%s", timestamp);
+
+  int i = strlen(src) ;
+  int last_occurence = 0;
+  for ( i ; i >= 0; i--) {
+	//printf("%d,%c\n",i,src[i]);
+	if (src[i] == '/') {
+		last_occurence = i;
+		break;
+	}
+  }
+
+  static char path_dir[1024] = {0};
+  static char filename[1024] = {0};
+
+  memcpy(path_dir,src, last_occurence + 1);
+
+  int j = 0;
+  for (i = last_occurence+1; i < strlen(src); i++) {
+    filename[j] = src[i] ;
+    j++;
+  }
+
+  // new file name
+  sprintf(dst,"%s.%s.%s", path_dir, filename, timestamp);
+
+  debugf("in bak_version, src=%s, dst=%s", src, dst);
+
+  dir_entry *src_de = path_info(src);
+  if (!src_de)
+      return -ENOENT;
+  if (src_de->isdir)
+    return -EISDIR;
+  if (copy_object(src, dst))
+  {
+    /* FIXME this isn't quite right as doesn't preserve last modified */
+    update_dir_cache(dst, src_de->size, 0);
+    return 1;
+  }
+  return 0;
+}
+///////////////////////////////
 
 
 static void dir_for(const char *path, char *dir)
@@ -233,6 +307,7 @@ static int cfs_fgetattr(const char *path, struct stat *stbuf, struct fuse_file_i
 
 static int cfs_readdir(const char *path, void *buf, fuse_fill_dir_t filldir, off_t offset, struct fuse_file_info *info)
 {
+  debugf("in cfs_readdir, path = %s", path);
   dir_entry *de;
   if (!caching_list_directory(path, &de))
     return -ENOLINK;
@@ -258,7 +333,9 @@ static int cfs_create(const char *path, mode_t mode, struct fuse_file_info *info
   FILE *temp_file = tmpfile();
   openfile *of = (openfile *)malloc(sizeof(openfile));
   of->fd = dup(fileno(temp_file));
+  //of->version=1;// added by jashing
   fclose(temp_file);
+
   of->flags = info->flags;
   info->fh = (uintptr_t)of;
   update_dir_cache(path, 0, 0);
@@ -281,9 +358,11 @@ static int cfs_open(const char *path, struct fuse_file_info *info)
   openfile *of = (openfile *)malloc(sizeof(openfile));
   of->fd = dup(fileno(temp_file));
   fclose(temp_file);
+
   of->flags = info->flags;
   info->fh = (uintptr_t)of;
   info->direct_io = 1;
+
   return 0;
 }
 
@@ -302,11 +381,13 @@ static int cfs_flush(const char *path, struct fuse_file_info *info)
     {
       FILE *fp = fdopen(dup(of->fd), "r");
       rewind(fp);
+
       if (!object_read_fp(path, fp))
       {
         fclose(fp);
         return -ENOENT;
       }
+      flush_flag = 1; // added by jashing
       fclose(fp);
     }
   }
@@ -315,9 +396,29 @@ static int cfs_flush(const char *path, struct fuse_file_info *info)
 
 static int cfs_release(const char *path, struct fuse_file_info *info)
 {
+  // added by jashing
+  // if the file has been modified and enable versioning
+  if (flush_flag == 1 && enable_versioning_flag == 1) {
+	  flush_flag = 0;
+	  if ((uintptr_t)info->fh) {
+		  if (bak_version(path)) {
+			  //debugf("creating bak version success");
+			  //
+		  } else {
+			  //debugf("creating bak version fail");
+			  // Do something here
+		  }
+	  }
+  }
+
   close(((openfile *)(uintptr_t)info->fh)->fd);
+
+  // jashing, add timestamp, when the file is closed
+  // set_creation_timestamp (path);
   return 0;
 }
+
+
 
 static int cfs_rmdir(const char *path)
 {
@@ -406,6 +507,38 @@ static int cfs_rename(const char *src, const char *dst)
   return -EIO;
 }
 
+// added by jashing, enabling ext-attr
+/** Set extended attributes */
+static int cfs_setxattr (const char* path, const char* name, const char* value, size_t size, int flags){
+	  set_annotation_meta(path,name,value);
+	  return 0;
+}
+
+/** Get extended attributes */
+static int cfs_getxattr (const char *path, const char *name, char *value, size_t size){
+
+	  int ret = get_annotation_meta(path,name);
+	  int alength = strlen(Annotation);
+	  if (value != 0) {
+		  size = alength;
+		  memcpy(value, Annotation, alength);
+	  }
+	  return alength;
+}
+
+/** List extended attributes */
+static int cfs_listxattr (const char *path, char *list, size_t size) {
+
+	  return 0;
+}
+
+/** Remove extended attributes */
+static int cfs_removexattr (const char *path, const char *name) {
+
+	  return 0;
+}
+////////////////////////////////////////////////////////////
+
 char *get_home_dir()
 {
   char *home;
@@ -423,12 +556,14 @@ static struct options {
     char cache_timeout[OPTION_SIZE];
     char authurl[OPTION_SIZE];
     char use_snet[OPTION_SIZE];
+    char versioning[OPTION_SIZE]; // added by jashing
 } options = {
     .username = "",
     .api_key = "",
     .cache_timeout = "600",
     .authurl = "https://auth.api.rackspacecloud.com/v1.0",
     .use_snet = "false",
+    .versioning = "false", // added by jashing
 };
 
 int parse_option(void *data, const char *arg, int key, struct fuse_args *outargs)
@@ -437,10 +572,20 @@ int parse_option(void *data, const char *arg, int key, struct fuse_args *outargs
       sscanf(arg, " api_key = %[^\r\n ]", options.api_key) ||
       sscanf(arg, " cache_timeout = %[^\r\n ]", options.cache_timeout) ||
       sscanf(arg, " authurl = %[^\r\n ]", options.authurl) ||
-      sscanf(arg, " use_snet = %[^\r\n ]", options.use_snet))
+      sscanf(arg, " use_snet = %[^\r\n ]", options.use_snet) ||
+      sscanf(arg, " versioning = %[^\r\n ]", options.versioning)) // added by jashing
     return 0;
+
+  // added by jashing
+  //if (!strcmp(arg, "versioning")) {
+    //enable_versioning_flag = 1;
+    //debugf("*************enabling versioning*****************\n");
+  //}
+
   if (!strcmp(arg, "-f") || !strcmp(arg, "-d") || !strcmp(arg, "debug"))
     cloudfs_debug(1);
+
+
   return 1;
 }
 
@@ -463,6 +608,11 @@ int main(int argc, char **argv)
 
   cache_timeout = atoi(options.cache_timeout);
 
+  // added by jashing
+  if (!strcmp(options.versioning, "true")) {
+    enable_versioning_flag = 1;
+  }
+
   if (!*options.username || !*options.api_key)
   {
     fprintf(stderr, "Unable to determine username and API key.\n\n");
@@ -474,6 +624,9 @@ int main(int argc, char **argv)
     fprintf(stderr, "  cache_timeout=[seconds for directory caching]\n");
     fprintf(stderr, "  use_snet=[True to connect to snet]\n");
     fprintf(stderr, "  authurl=[used for testing]\n");
+
+    // added by jashing
+    fprintf(stderr, "  versioning=[false|true] (default:false)\n");
     return 1;
   }
 
@@ -509,7 +662,14 @@ int main(int argc, char **argv)
     .chmod = cfs_chmod,
     .chown = cfs_chown,
     .rename = cfs_rename,
+
+    // added by jashing
+    .setxattr = cfs_setxattr,
+    .getxattr = cfs_getxattr,
+    .listxattr = cfs_listxattr,
+    .removexattr = cfs_removexattr,
   };
+
 
   pthread_mutex_init(&dmut, NULL);
   signal(SIGPIPE, SIG_IGN);

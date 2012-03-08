@@ -15,6 +15,7 @@
 #include <libxml/tree.h>
 #include "cloudfsapi.h"
 #include "config.h"
+#include <unistd.h>
 
 #define REQUEST_RETRIES 4
 
@@ -25,9 +26,20 @@ static CURL *curl_pool[1024];
 static int curl_pool_count = 0;
 static int debug = 0;
 
+// added by jashing
+static char timestamp[20];
+static char UID[6];
+static char GID[6];
+char Annotation[MAX_ANN_SIZE];
+
+void debugf(char *fmt, ...);
+size_t header_dispatch_meta(void *ptr, size_t size, size_t nmemb, void *stream);
+//////////////////
+
 #ifdef HAVE_OPENSSL
 #include <openssl/crypto.h>
 static pthread_mutex_t *ssl_lockarray;
+
 static void lock_callback(int mode, int type, char *file, int line)
 {
   if (mode & CRYPTO_LOCK)
@@ -202,6 +214,7 @@ int object_read_fp(const char *path, FILE *fp)
   return (response >= 200 && response < 300);
 }
 
+
 int object_write_fp(const char *path, FILE *fp)
 {
   char *encoded = curl_escape(path, 0);
@@ -334,6 +347,141 @@ int delete_object(const char *path)
   return (response >= 200 && response < 300);
 }
 
+
+// added by jashing
+char *time_stamp(){
+  time_t ltime;
+  ltime=time(NULL);
+  struct tm *tm;
+  tm=localtime(&ltime);
+
+  sprintf(timestamp,"%04d %02d %02d %02d:%02d:%02d", tm->tm_year+1900, tm->tm_mon,
+    tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec);
+
+  return timestamp; // useless
+}
+
+char *get_uid(){
+ uid_t uid;
+
+  if (-1 == (uid = getuid()))
+	 debugf("getuid() error.");
+  else
+     debugf("The real UID is: %u\n", uid);
+  sprintf(UID,"%04u", uid);
+
+  return UID; // useless
+}
+
+char *get_gid(){
+ gid_t gid;
+
+  if (-1 == (gid = getgid()))
+	 debugf("getgid() error.");
+  else
+     debugf("The real GID is: %u\n", gid);
+  sprintf(GID,"%04u", gid);
+
+  return GID; // useless
+}
+
+int set_creation_timestamp(const char *path) {
+      char *encoded = curl_escape(path, 0);
+	  curl_slist *headers = NULL;
+	  time_stamp();
+	  get_uid();
+	  get_gid();
+	  add_header(&headers, "X-Object-Meta-Timestamp", timestamp);
+	  add_header(&headers, "X-Object-Meta-Version", "0");
+	  add_header(&headers, "X-Object-Meta-UID", UID);
+	  add_header(&headers, "X-Object-Meta-GID", GID);
+	  int response = send_request("POST", encoded, NULL, NULL, headers);
+	  curl_free(encoded);
+	  curl_slist_free_all(headers);
+	  return (response >= 200 && response < 300);
+}
+
+int set_annotation_meta(const char *path, const char* name, const char* value) {
+      char *encoded = curl_escape(path, 0);
+	  curl_slist *headers = NULL;
+	  char meta_name[256] = {0};
+	  sprintf(meta_name,"X-Object-Meta-%s",name);
+
+	  add_header(&headers, meta_name, value);
+
+	  int response = send_request("POST", encoded, NULL, NULL, headers);
+	  curl_free(encoded);
+	  curl_slist_free_all(headers);
+	  return (response >= 200 && response < 300);
+}
+
+int get_annotation_meta(const char *path, const char* name) {
+	  memset(Annotation, 0x00, sizeof(Annotation));
+      char *encoded = curl_escape(path, 0);
+	  long response = -1;
+	  int tries = 0;
+
+	  // retry on failures
+	  for (tries = 0; tries < REQUEST_RETRIES; tries++)
+	  {
+	    CURL *curl = get_connection(encoded);
+	    curl_slist *headers = NULL;
+	    add_header(&headers, "X-Auth-Token", storage_token);
+	    //curl_easy_setopt(curl, CURLOPT_NOBODY, true); // HEAD
+	    //curl_easy_setopt(curl, CURLOPT_FILETIME, true); // Last-Modified
+	    curl_easy_setopt(curl, CURLOPT_VERBOSE, debug);
+	    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &header_dispatch_meta);
+	    curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT);
+	    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
+	    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0);
+	    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0);
+	    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10);
+	    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10);
+	    curl_easy_perform(curl);
+	    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response);
+	    curl_slist_free_all(headers);
+	    curl_easy_cleanup(curl);
+
+	    if (response >= 200 && response < 400 && Annotation[0]) {
+	      //debugf("Get Annotation = %s", Annotation);
+	      return response;
+	    }
+	  }
+	  return response;
+}
+///////////////////////////////////
+
+size_t header_dispatch_meta(void *ptr, size_t size, size_t nmemb, void *stream)
+{
+  debugf("GOOD, go into header_dispatch_meta\n");
+  char *header = (char *)alloca(size * nmemb + 1);
+  char *head = (char *)alloca(size * nmemb + 1);
+  char *value = (char *)alloca(size * nmemb + 1);
+  memcpy(header, (char *)ptr, size * nmemb);
+  header[size * nmemb] = '\0';
+
+  debugf("header=%s\n", header);
+  if (sscanf(header, "%[^:]: %[^\r\n]", head, value) == 2)
+  {
+    // added by jashing ,   X-Object-Meta-Annotation
+    if (!strncasecmp(head, "X-Object-Meta-Annotation", size * nmemb)) {
+      strncpy(Annotation, value, sizeof(Annotation));
+      debugf("Annotation=%s, size=%d\n", Annotation, size * nmemb);
+    }
+  }
+  return size * nmemb;
+}
+
+
+int get_annotation_meta2(const char *path, const char* name) {
+      char *encoded = curl_escape(path, 0);
+
+	  int response = send_request("HEAD", encoded, NULL, NULL, NULL);
+	  curl_free(encoded);
+	  return (response >= 200 && response < 300);
+}
+
 int copy_object(const char *src, const char *dst)
 {
   char *dst_encoded = curl_escape(dst, 0);
@@ -436,6 +584,10 @@ size_t header_dispatch(void *ptr, size_t size, size_t nmemb, void *stream)
       strncpy(storage_token, value, sizeof(storage_token));
     if (!strncasecmp(head, "x-storage-url", size * nmemb))
       strncpy(storage_url, value, sizeof(storage_url));
+
+    // added by jashing
+    if (!strncasecmp(head, "X-Object-Meta-Annotation", size * nmemb))
+      strncpy(Annotation, value, sizeof(Annotation));
   }
   return size * nmemb;
 }
